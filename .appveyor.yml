@@ -3,6 +3,8 @@ environment:
   APPVEYOR_SAVE_CACHE_ON_ERROR: true
   access_token:
     secure: 21m76jAVvcu7oACAHFnfCBltcwon+r5ZI3avfRmrNFAqJMn6RfLXwpBhPcJ617tD
+  github_auth_token:
+    secure: E58r+OknoQn8+bsPRT6l3U2K4kfOpDiGCo1C75LkVg+R/RBHpY//J8UCXEfVvyRB
 image: Visual Studio 2019
 configuration: Release
 before_build:
@@ -53,6 +55,8 @@ deploy:
     artifact: /.*\.nupkg/           # upload all NuGet packages to release assets
     draft: true
     prerelease: true
+    auth_token:
+      github_auth_token 
     on:
       branch: master                # release from master branch only
-      APPVEYOR_REPO_TAG: true       # deploy on tag push only
+#      APPVEYOR_REPO_TAG: true       # deploy on tag push only
