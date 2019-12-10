@@ -56,7 +56,7 @@ deploy:
     draft: true
     prerelease: true
     auth_token:
-      github_auth_token 
+      secure: E58r+OknoQn8+bsPRT6l3U2K4kfOpDiGCo1C75LkVg+R/RBHpY//J8UCXEfVvyRB
     on:
       branch: github_publish                # release from master branch only
 #      APPVEYOR_REPO_TAG: true       # deploy on tag push only
