@@ -52,6 +52,8 @@ deploy:
       APPVEYOR_REPO_TAG: true       # deploy on tag push only
       appveyor_repo_tag: true
   - provider: GitHub
+    release: SIPSorcery-v$(appveyor_build_version)
+    description: 'Release description'
     artifact: /.*\.nupkg/           # upload all NuGet packages to release assets
     draft: true
     prerelease: true
