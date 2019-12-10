@@ -21,7 +21,7 @@ build:
 #    - Integration
 on_success:
   - ps: |
-        if(-Not $env:APPVEYOR_PULL_REQUEST_TITLE)
+        if($env:APPVEYOR_REPO_BRANCH -eq "master" -and -Not $env:APPVEYOR_PULL_REQUEST_TITLE)
         {
            git config --global credential.helper store
             Add-Content "$HOME\.git-credentials" "https://$($env:access_token):x-oauth-basic@github.com`n"
@@ -58,5 +58,5 @@ deploy:
     auth_token:
       github_auth_token 
     on:
-      branch: master                # release from master branch only
+      branch: github_publish                # release from master branch only
 #      APPVEYOR_REPO_TAG: true       # deploy on tag push only
