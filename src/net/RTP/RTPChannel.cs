@@ -90,7 +90,7 @@ namespace SIPSorcery.Net
             // initial RTP packets. Experience has shown that it's not safe to close an RTP connection based solely on ICMP packets.
             catch (SocketException sockExcp)
             {
-                logger.LogWarning(sockExcp, $"Socket error {sockExcp.SocketErrorCode} in UdpReceiver.BeginReceiveFrom. {sockExcp.Message}");
+                logger.LogWarning($"Socket error {sockExcp.SocketErrorCode} in UdpReceiver.BeginReceiveFrom. {sockExcp.Message}");
                 //Close(sockExcp.Message);
             }
             catch (Exception excp)
@@ -98,7 +98,7 @@ namespace SIPSorcery.Net
                 // From https://github.com/dotnet/corefx/blob/e99ec129cfd594d53f4390bf97d1d736cff6f860/src/System.Net.Sockets/src/System/Net/Sockets/Socket.cs#L3262
                 // the BeginReceiveFrom will only throw if there is an problem with the arguments or the socket has been disposed of. In that
                 // case the socket can be considered to be unusable and there's no point trying another receive.
-                logger.LogError($"Exception UdpReceiver.BeginReceiveFrom. {excp.Message}");
+                logger.LogError(excp, $"Exception UdpReceiver.BeginReceiveFrom. {excp.Message}");
                 Close(excp.Message);
             }
         }
@@ -128,29 +128,28 @@ namespace SIPSorcery.Net
                         //}
 
                         byte[] packetBuffer = new byte[bytesRead];
-                        // TODO: When .NET Frmework support is dropped switch to using a slice instead of a copy.
+                        // TODO: When .NET Framework support is dropped switch to using a slice instead of a copy.
                         Buffer.BlockCopy(m_recvBuffer, 0, packetBuffer, 0, bytesRead);
                         OnPacketReceived?.Invoke(this, m_localEndPoint.Port, remoteEP as IPEndPoint, packetBuffer);
                     }
                 }
 
                 // If there is still data available it should be read now. This is more efficient than calling
-                // BeginReceiveFrom which will incur the overheaed of creating the callback and then immediately firing it.
+                // BeginReceiveFrom which will incur the overhead of creating the callback and then immediately firing it.
                 // It also avoids the situation where if the application cannot keep up with the network then BeginReceiveFrom
                 // will be called synchronously (if data is available it calls the callback method immediately) which can
                 // create a very nasty stack.
                 if (!m_isClosed && m_udpSocket.Available > 0)
                 {
-                    EndPoint remoteEP = m_addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
-
                     while (!m_isClosed && m_udpSocket.Available > 0)
                     {
+                        EndPoint remoteEP = m_addressFamily == AddressFamily.InterNetwork ? new IPEndPoint(IPAddress.Any, 0) : new IPEndPoint(IPAddress.IPv6Any, 0);
                         int bytesReadSync = m_udpSocket.ReceiveFrom(m_recvBuffer, 0, m_recvBuffer.Length, SocketFlags.None, ref remoteEP);
 
                         if (bytesReadSync > 0)
                         {
                             byte[] packetBufferSync = new byte[bytesReadSync];
-                            // TODO: When .NET Frmework support is dropped switch to using a slice instead of a copy.
+                            // TODO: When .NET Framework support is dropped switch to using a slice instead of a copy.
                             Buffer.BlockCopy(m_recvBuffer, 0, packetBufferSync, 0, bytesReadSync);
                             OnPacketReceived?.Invoke(this, m_localEndPoint.Port, remoteEP as IPEndPoint, packetBufferSync);
                         }

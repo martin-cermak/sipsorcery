@@ -5,23 +5,31 @@
 // described in the Interactive Connectivity Establishment RFC8445
 // https://tools.ietf.org/html/rfc8445.
 //
-// Additionally support for the following standards or proposed standards 
+// Remarks:
+//
+// Support for the following standards or proposed standards 
 // is included:
+//
 // - "Trickle ICE" as per draft RFC
 //   https://tools.ietf.org/html/draft-ietf-ice-trickle-21.
-// - "WebRTC IP Address Handling Requirements" as per draft RFC
+//
+// - "WebRTC IP Address Handling Requirements" as per draft RFC 
 //   https://tools.ietf.org/html/draft-ietf-rtcweb-ip-handling-12
 //   SECURITY NOTE: See https://tools.ietf.org/html/draft-ietf-rtcweb-ip-handling-12#section-5.2
 //   for recommendations on how a WebRTC application should expose a
 //   hosts IP address information. This implementation is using Mode 2.
+//
 // - Session Traversal Utilities for NAT (STUN)
 //   https://tools.ietf.org/html/rfc8553
+//
 // - Traversal Using Relays around NAT (TURN): Relay Extensions to 
 //   Session Traversal Utilities for NAT (STUN)
 //   https://tools.ietf.org/html/rfc5766
+//
 // - Using Multicast DNS to protect privacy when exposing ICE candidates
 //   draft-ietf-rtcweb-mdns-ice-candidates-04 [ed. not implemented as of 26 Jul 2020].
 //   https://tools.ietf.org/html/draft-ietf-rtcweb-mdns-ice-candidates-04
+//
 // - Multicast DNS
 //   https://tools.ietf.org/html/rfc6762
 //
@@ -42,7 +50,7 @@
 // c:\> dns-sd -G v4 fbba6380-2cc4-41b1-ab0d-61548dd28a29.local
 // c:\> dns-sd -G v6 b1f949b8-5ec9-41a6-b3ef-eb529f217de9.local
 // But it's expected that it's highly unlikely support will be added to .NET Core
-// anytime soon (AC 26 Jul 2020).
+// any time soon (AC 26 Jul 2020).
 //
 // Author(s):
 // Aaron Clauson (aaron@sipsorcery.com)
@@ -244,7 +252,9 @@ namespace SIPSorcery.Net
         private bool _closed = false;
         private Timer _connectivityChecksTimer;
         private Timer _processIceServersTimer;
-        private DateTime _checlistStartedAt = DateTime.MinValue;
+        private DateTime _checklistStartedAt = DateTime.MinValue;
+        private bool _includeAllInterfaceAddresses = false;
+        private ulong _iceTiebreaker;
 
         public event Action<RTCIceCandidate> OnIceCandidate;
         public event Action<RTCIceConnectionState> OnIceConnectionStateChange;
@@ -292,28 +302,34 @@ namespace SIPSorcery.Net
         /// Creates a new instance of an RTP ICE channel to provide RTP channel functions 
         /// with ICE connectivity checks.
         /// </summary>
-        /// <param name="bindAddress"> Optional. If supplied this address will 
-        /// dictate which local interface host ICE candidates will be gathered from.
-        /// Restricting the host candidate IP addresses to a single interface is 
-        /// as per the recommendation at:
-        /// https://tools.ietf.org/html/draft-ietf-rtcweb-ip-handling-12#section-5.2.
-        /// If this is not set then the default is to use the Internet facing interface as
-        /// returned by the OS routing table.</param>
+        /// <param name="bindAddress"> Optional. If this is not set then the default is to 
+        /// bind to the IPv6 wildcard address in dual mode to the IPv4 wildcard address if
+        /// IPv6 is not available.</param>
         /// <param name="component">The component (RTP or RTCP) the channel is being used for. Note
         /// for cases where RTP and RTCP are multiplexed the component is set to RTP.</param>
         /// <param name="iceServers">A list of STUN or TURN servers that can be used by this ICE agent.</param>
         /// <param name="policy">Determines which ICE candidates can be used in this RTP ICE Channel.</param>
+        /// <param name="includeAllInterfaceAddresses">If set to true then IP addresses from ALL local  
+        /// interfaces will be used for host ICE candidates. If left as the default false value host 
+        /// candidates will be restricted to the single interface that the OS routing table matches to
+        /// the destination address or the Internet facing interface if the destination is not known.
+        /// The restrictive behaviour is as per the recommendation at:
+        /// https://tools.ietf.org/html/draft-ietf-rtcweb-ip-handling-12#section-5.2.
+        /// </param>
         public RtpIceChannel(
             IPAddress bindAddress,
             RTCIceComponent component,
             List<RTCIceServer> iceServers = null,
-            RTCIceTransportPolicy policy = RTCIceTransportPolicy.all) :
+            RTCIceTransportPolicy policy = RTCIceTransportPolicy.all,
+            bool includeAllInterfaceAddresses = false) :
             base(false, bindAddress)
         {
             _bindAddress = bindAddress;
             Component = component;
             _iceServers = iceServers;
             _policy = policy;
+            _includeAllInterfaceAddresses = includeAllInterfaceAddresses;
+            _iceTiebreaker = Crypto.GetRandomULong();
 
             LocalIceUser = Crypto.GetRandomString(ICE_UFRAG_LENGTH);
             LocalIcePassword = Crypto.GetRandomString(ICE_PASSWORD_LENGTH);
@@ -332,24 +348,6 @@ namespace SIPSorcery.Net
                 RTCIceCandidateType.host,
                 null,
                 0);
-
-            if (iceServers != null)
-            {
-                InitialiseIceServers(_iceServers);
-
-                // DNS is only needed if there are ICE server hostnames to lookup.
-                if (_dnsLookupClient == null && _iceServerConnections.Any(x => !IPAddress.TryParse(x.Key.Host, out _)))
-                {
-                    if (DefaultNameServers != null)
-                    {
-                        _dnsLookupClient = new DnsClient.LookupClient(DefaultNameServers.ToArray());
-                    }
-                    else
-                    {
-                        _dnsLookupClient = new DnsClient.LookupClient();
-                    }
-                }
-            }
         }
 
         /// <summary>
@@ -360,8 +358,26 @@ namespace SIPSorcery.Net
         /// </summary>
         public void StartGathering()
         {
-            if (IceGatheringState == RTCIceGatheringState.@new)
+            if (!_closed && IceGatheringState == RTCIceGatheringState.@new)
             {
+                if (_iceServers != null)
+                {
+                    InitialiseIceServers(_iceServers);
+
+                    // DNS is only needed if there are ICE server hostnames to lookup.
+                    if (_dnsLookupClient == null && _iceServerConnections.Any(x => !IPAddress.TryParse(x.Key.Host, out _)))
+                    {
+                        if (DefaultNameServers != null)
+                        {
+                            _dnsLookupClient = new DnsClient.LookupClient(DefaultNameServers.ToArray());
+                        }
+                        else
+                        {
+                            _dnsLookupClient = new DnsClient.LookupClient();
+                        }
+                    }
+                }
+
                 _startedGatheringAt = DateTime.Now;
 
                 // Start listening on the UDP socket.
@@ -410,12 +426,23 @@ namespace SIPSorcery.Net
             RemoteIceUser = username;
             RemoteIcePassword = password;
 
-            _checlistStartedAt = DateTime.Now;
+            if (IceConnectionState == RTCIceConnectionState.@new)
+            {
+                // A potential race condition exists here. The remote peer can send a binding request that
+                // results in the ICE channel connecting BEFORE the remote credentials get set. Since the goal
+                // is to connect ICE as quickly as possible it does not seem sensible to force a wait for the
+                // remote credentials to be set. The credentials will still be used on STUN binding requests
+                // sent on the connected ICE channel. In the case of WebRTC transport confidentiality is still
+                // preserved since the DTLS negotiation will sill need to check the certificate fingerprint in
+                // supplied by the remote offer.
 
-            // Once the remote party's ICE credentials are known connection checking can 
-            // commence immediately as candidates trickle in.
-            IceConnectionState = RTCIceConnectionState.checking;
-            OnIceConnectionStateChange?.Invoke(IceConnectionState);
+                _checklistStartedAt = DateTime.Now;
+
+                // Once the remote party's ICE credentials are known connection checking can 
+                // commence immediately as candidates trickle in.
+                IceConnectionState = RTCIceConnectionState.checking;
+                OnIceConnectionStateChange?.Invoke(IceConnectionState);
+            }
         }
 
         /// <summary>
@@ -537,7 +564,13 @@ namespace SIPSorcery.Net
         ///   
         /// This implementation implements Mode 2.
         /// </summary>
-        /// <remarks>See https://tools.ietf.org/html/rfc8445#section-5.1.1.1</remarks>
+        /// <remarks>
+        /// See https://tools.ietf.org/html/rfc8445#section-5.1.1.1
+        /// See https://tools.ietf.org/html/rfc6874 for a recommendation on how scope or zone ID's
+        /// should be represented as strings in IPv6 link local addresses. Due to parsing
+        /// issues in at least two other WebRTC stacks (as of Feb 2021) any zone ID is removed
+        /// from an ICE candidate string.
+        /// </remarks>
         /// <returns>A list of "host" ICE candidates for the local machine.</returns>
         private List<RTCIceCandidate> GetHostCandidates()
         {
@@ -567,21 +600,21 @@ namespace SIPSorcery.Net
                 if (base.RtpSocket.DualMode)
                 {
                     // IPv6 dual mode listening on [::] means we can use all valid local addresses.
-                    localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress)
-                        .Where(x => !IPAddress.IsLoopback(x) && !x.IsIPv4MappedToIPv6 && !x.IsIPv6SiteLocal).ToList();
+                    localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress, _includeAllInterfaceAddresses)
+                        .Where(x => !IPAddress.IsLoopback(x) && !x.IsIPv4MappedToIPv6 && !x.IsIPv6SiteLocal && !x.IsIPv6LinkLocal).ToList();
                 }
                 else
                 {
                     // IPv6 but not dual mode on [::] means can use all valid local IPv6 addresses.
-                    localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress)
+                    localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress, _includeAllInterfaceAddresses)
                         .Where(x => x.AddressFamily == AddressFamily.InterNetworkV6
-                        && !IPAddress.IsLoopback(x) && !x.IsIPv4MappedToIPv6 && !x.IsIPv6SiteLocal).ToList();
+                        && !IPAddress.IsLoopback(x) && !x.IsIPv4MappedToIPv6 && !x.IsIPv6SiteLocal && !x.IsIPv6LinkLocal).ToList();
                 }
             }
             else if (IPAddress.Any.Equals(rtpBindAddress))
             {
                 // IPv4 on 0.0.0.0 means can use all valid local IPv4 addresses.
-                localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress)
+                localAddresses = NetServices.GetLocalAddressesOnInterface(_bindAddress, _includeAllInterfaceAddresses)
                     .Where(x => x.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(x)).ToList();
             }
             else
@@ -681,7 +714,7 @@ namespace SIPSorcery.Net
         /// </summary>
         private void CheckIceServers(Object state)
         {
-            if (IceGatheringState == RTCIceGatheringState.complete ||
+            if (_closed || IceGatheringState == RTCIceGatheringState.complete ||
                 !(IceConnectionState == RTCIceConnectionState.@new || IceConnectionState == RTCIceConnectionState.checking))
             {
                 logger.LogDebug($"ICE RTP channel stopping ICE server checks in gathering state {IceGatheringState} and connection state {IceConnectionState}.");
@@ -1070,8 +1103,8 @@ namespace SIPSorcery.Net
         /// </remarks>
         private async void ProcessChecklist()
         {
-            if (IceConnectionState == RTCIceConnectionState.@new ||
-                IceConnectionState == RTCIceConnectionState.checking)
+            if (!_closed && (IceConnectionState == RTCIceConnectionState.@new ||
+                IceConnectionState == RTCIceConnectionState.checking))
             {
                 while (_pendingRemoteCandidates.Count() > 0)
                 {
@@ -1081,7 +1114,7 @@ namespace SIPSorcery.Net
                         {
                             // The reason not to wait for this operation is that the ICE candidate can
                             // contain a hostname and require a DNS lookup. There's nothing that can be done
-                            // if the DNS lookup fails so the initiate the task and then keep going with the
+                            // if the DNS lookup fails so initiate the task and then keep going with
                             // adding any other pending candidates and move on with processing the check list.
                             _ = UpdateChecklist(_localChecklistCandidate, candidate);
                         }
@@ -1154,16 +1187,16 @@ namespace SIPSorcery.Net
                             }
                         }
                     }
-                    else if (_checlistStartedAt != DateTime.MinValue &&
-                        DateTime.Now.Subtract(_checlistStartedAt).TotalSeconds > FAILED_TIMEOUT_PERIOD)
+                    else if (_checklistStartedAt != DateTime.MinValue &&
+                        DateTime.Now.Subtract(_checklistStartedAt).TotalSeconds > FAILED_TIMEOUT_PERIOD)
                     {
                         // No checklist entries were made available before the failed timeout.
-                        logger.LogWarning($"ICE RTP channel failed to connect as no checklist entries became available within {DateTime.Now.Subtract(_checlistStartedAt).TotalSeconds}s.");
+                        logger.LogWarning($"ICE RTP channel failed to connect as no checklist entries became available within {DateTime.Now.Subtract(_checklistStartedAt).TotalSeconds:0.##}s.");
 
                         _checklistState = ChecklistState.Failed;
                         //IceConnectionState = RTCIceConnectionState.disconnected;
                         // No point going to and ICE disconnected state as there was never a connection and therefore
-                        // nothing ot monitor for a re-connection.
+                        // nothing to monitor for a re-connection.
                         IceConnectionState = RTCIceConnectionState.failed;
                         OnIceConnectionStateChange?.Invoke(IceConnectionState);
                     }
@@ -1221,6 +1254,11 @@ namespace SIPSorcery.Net
         /// </remarks>
         private void SendConnectivityCheck(ChecklistEntry candidatePair, bool setUseCandidate)
         {
+            if(_closed)
+            {
+                return;
+            }
+
             if (candidatePair.FirstCheckSentAt == DateTime.MinValue)
             {
                 candidatePair.FirstCheckSentAt = DateTime.Now;
@@ -1277,6 +1315,15 @@ namespace SIPSorcery.Net
             stunRequest.Header.TransactionId = Encoding.ASCII.GetBytes(candidatePair.RequestTransactionID);
             stunRequest.AddUsernameAttribute(RemoteIceUser + ":" + LocalIceUser);
             stunRequest.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.Priority, BitConverter.GetBytes(candidatePair.LocalPriority)));
+
+            if(IsController)
+            {
+                stunRequest.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.IceControlling, NetConvert.GetBytes(_iceTiebreaker)));
+            }
+            else
+            {
+                stunRequest.Attributes.Add(new STUNAttribute(STUNAttributeTypesEnum.IceControlled, NetConvert.GetBytes(_iceTiebreaker)));
+            }
 
             if (setUseCandidate)
             {
@@ -1378,6 +1425,11 @@ namespace SIPSorcery.Net
         /// <param name="remoteEndPoint">The remote end point the STUN packet was received from.</param>
         public async Task ProcessStunMessage(STUNMessage stunMessage, IPEndPoint remoteEndPoint, bool wasRelayed)
         {
+            if(_closed)
+            {
+                return;
+            }
+
             remoteEndPoint = (!remoteEndPoint.Address.IsIPv4MappedToIPv6) ? remoteEndPoint : new IPEndPoint(remoteEndPoint.Address.MapToIPv4(), remoteEndPoint.Port);
 
             OnStunMessageReceived?.Invoke(stunMessage, remoteEndPoint, wasRelayed);
@@ -1459,9 +1511,14 @@ namespace SIPSorcery.Net
         /// by this ICE channel (i.e. the ICE server that this channel is acting as the client with).</param>
         private void GotStunBindingRequest(STUNMessage bindingRequest, IPEndPoint remoteEndPoint, bool wasRelayed)
         {
+            if (_closed)
+            {
+                return;
+            }
+
             if (_policy == RTCIceTransportPolicy.relay && !wasRelayed)
             {
-                // If the policy is "relay only" then direct binding requests are accepted.
+                // If the policy is "relay only" then direct binding requests are not accepted.
                 logger.LogWarning($"ICE RTP channel rejecting non-relayed STUN binding request from {remoteEndPoint}.");
 
                 STUNMessage stunErrResponse = new STUNMessage(STUNMessageTypesEnum.BindingErrorResponse);
@@ -1500,7 +1557,8 @@ namespace SIPSorcery.Net
                          ).FirstOrDefault();
                     }
 
-                    if (matchingChecklistEntry == null && (_remoteCandidates == null || !_remoteCandidates.Any(x => x.IsEquivalentEndPoint(RTCIceProtocol.udp, remoteEndPoint))))
+                    if (matchingChecklistEntry == null && 
+                        (_remoteCandidates == null || !_remoteCandidates.Any(x => x.IsEquivalentEndPoint(RTCIceProtocol.udp, remoteEndPoint))))
                     {
                         // This STUN request has come from a socket not in the remote ICE candidates list. 
                         // Add a new remote peer reflexive candidate. 

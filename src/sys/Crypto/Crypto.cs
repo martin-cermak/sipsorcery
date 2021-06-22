@@ -20,6 +20,7 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 
 namespace SIPSorcery.Sys
@@ -33,7 +34,21 @@ namespace SIPSorcery.Sys
 
         private static ILogger logger = Log.Logger;
 
-        private static Random _rng = new Random();
+        static int seed = Environment.TickCount;
+
+        static readonly ThreadLocal<Random> random =
+            new ThreadLocal<Random>(() => new Random(Interlocked.Increment(ref seed)));
+
+        public static int Rand()
+        {
+            return random.Value.Next();
+        }
+
+        public static int Rand(int maxValue)
+        {
+            return random.Value.Next(maxValue);
+        }
+
         private static RNGCryptoServiceProvider m_randomProvider = new RNGCryptoServiceProvider();
 
         //public static string RSAEncrypt(string xmlKey, string plainText)
@@ -179,7 +194,7 @@ namespace SIPSorcery.Sys
 
             for (int i = 0; i < length; i++)
             {
-                buffer[i] = CHARS[_rng.Next(CHARS.Length)];
+                buffer[i] = CHARS[Rand(CHARS.Length)];
             }
             return new string(buffer);
         }
@@ -253,11 +268,26 @@ namespace SIPSorcery.Sys
             return BitConverter.ToUInt16(uint16Buffer, 0);
         }
 
-        public static UInt32 GetRandomUInt()
+        public static UInt32 GetRandomUInt(bool noZero = false)
         {
             byte[] uint32Buffer = new byte[4];
             m_randomProvider.GetBytes(uint32Buffer);
-            return BitConverter.ToUInt32(uint32Buffer, 0);
+            var randomUint = BitConverter.ToUInt32(uint32Buffer, 0);
+
+            if(noZero && randomUint == 0)
+            {
+                m_randomProvider.GetBytes(uint32Buffer);
+                randomUint = BitConverter.ToUInt32(uint32Buffer, 0);
+            }
+
+            return randomUint;
+        }
+
+        public static UInt64 GetRandomULong()
+        {
+            byte[] uint64Buffer = new byte[8];
+            m_randomProvider.GetBytes(uint64Buffer);
+            return BitConverter.ToUInt64(uint64Buffer, 0);
         }
 
         //public static string GetRandomString(int length)
@@ -377,6 +407,19 @@ namespace SIPSorcery.Sys
             string hashStr = null;
             hash.ToList().ForEach(b => hashStr += b.ToString("x2"));
             return hashStr;
+        }
+
+        /// <summary>
+        /// Gets the HSA256 hash of an arbitrary buffer.
+        /// </summary>
+        /// <param name="buffer">The buffer to hash.</param>
+        /// <returns>A hex string representing the hashed buffer.</returns>
+        public static string GetSHA256Hash(byte[] buffer)
+        {
+            using(SHA256Managed sha256 = new SHA256Managed())
+            {
+                return sha256.ComputeHash(buffer).HexStr();
+            }
         }
 
         /// <summary>

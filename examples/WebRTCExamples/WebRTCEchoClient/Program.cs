@@ -28,7 +28,6 @@ using Serilog;
 using Serilog.Extensions.Logging;
 using SIPSorcery.Media;
 using SIPSorcery.Net;
-using SIPSorcery.Sys;
 using SIPSorceryMedia.Abstractions;
 using SIPSorceryMedia.Encoders;
 
@@ -36,10 +35,14 @@ namespace demo
 {
     class Program
     {
-        private const string SIGNALING_SERVER = "http://localhost:5002";
-        private const string SIGNALING_OFFER_RESOURCE = "offer";
-        private const string SIGNALING_ANSWER_RESOURCE = "answer";
-        private const int RANDOM_LOCALID_LENGTH = 8;
+        //private const string SIGNALING_SERVER = "https://sipsorcery.cloud/janus/echo/offer";
+        //private const string SIGNALING_SERVER = "https://sipsorcery.cloud/sipsorcery/echo/offer";
+        //private const string SIGNALING_SERVER = "https://sipsorcery.cloud/aiortc/echo/offer";
+
+        //private const string SIGNALING_SERVER = "http://localhost:5002/offer";
+        //private const string SIGNALING_SERVER = "http://localhost:8080/offer";
+        private const string SIGNALING_SERVER = "http://172.18.92.116:8080/offer";
+
         private static int VIDEO_FRAME_WIDTH = 640;
         private static int VIDEO_FRAME_HEIGHT = 480;
 
@@ -136,32 +139,32 @@ namespace demo
 
             #endregion
 
-            await testPattern.StartVideo().ConfigureAwait(false);
+            //await testPattern.StartVideo().ConfigureAwait(false);
 
             var pc = await CreatePeerConnection(testPattern, vp8VideoSink).ConfigureAwait(false);
 
-            string localID = Crypto.GetRandomString(RANDOM_LOCALID_LENGTH);
-
-            Console.WriteLine($"Get offer from {SIGNALING_SERVER}/{SIGNALING_OFFER_RESOURCE}/{localID}.");
+            Console.WriteLine($"Sending offer to {SIGNALING_SERVER}.");
 
             var signaler = new HttpClient();
-            var offerResult = await signaler.GetAsync($"{SIGNALING_SERVER}/{SIGNALING_OFFER_RESOURCE}/{localID}", cts.Token).ConfigureAwait(false);
-            var offerStr = await offerResult.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-            if (RTCSessionDescriptionInit.TryParse(offerStr, out var offerInit))
+            var offer = pc.createOffer(null);
+            await pc.setLocalDescription(offer).ConfigureAwait(false);
+
+            var content = new StringContent(offer.toJSON(), Encoding.UTF8, "application/json");
+            var response = await signaler.PostAsync($"{SIGNALING_SERVER}", content).ConfigureAwait(false);
+            var answerStr = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            if (RTCSessionDescriptionInit.TryParse(answerStr, out var answerInit))
             {
-                var setOfferResult = pc.setRemoteDescription(offerInit);
-                if (setOfferResult == SetDescriptionResultEnum.OK)
+                var setAnswerResult = pc.setRemoteDescription(answerInit);
+                if (setAnswerResult != SetDescriptionResultEnum.OK)
                 {
-                    var answer = pc.createAnswer(null);
-                    await pc.setLocalDescription(answer).ConfigureAwait(false);
-                    var content = new StringContent(answer.toJSON(), Encoding.UTF8, "application/json");
-                    await signaler.PostAsync($"{SIGNALING_SERVER}/{SIGNALING_ANSWER_RESOURCE}/{localID}", content).ConfigureAwait(false);
+                    Console.WriteLine($"Set remote description failed {setAnswerResult}.");
                 }
-                else
-                {
-                    Console.WriteLine($"Set remote description failed {setOfferResult}.");
-                }
+            }
+            else
+            {
+                Console.WriteLine("Failed to parse SDP answer from signaling server.");
             }
 
             Console.WriteLine("Press any key to exit.");
@@ -170,12 +173,12 @@ namespace demo
 
         private static Task<RTCPeerConnection> CreatePeerConnection(IVideoSource videoSource, IVideoSink videoSink)
         {
-            var pc = new RTCPeerConnection(null);
+            var pc = new RTCPeerConnection(new RTCConfiguration { X_ICEIncludeAllInterfaceAddresses = true });
 
-            MediaStreamTrack videoTrack = new MediaStreamTrack(videoSink.GetVideoSinkFormats(), MediaStreamStatusEnum.SendRecv);
+            MediaStreamTrack videoTrack = new MediaStreamTrack(videoSink.GetVideoSinkFormats(), MediaStreamStatusEnum.RecvOnly);
             pc.addTrack(videoTrack);
 
-            videoSource.OnVideoSourceEncodedSample += pc.SendVideo;
+            //videoSource.OnVideoSourceEncodedSample += pc.SendVideo;
             pc.OnVideoFrameReceived += videoSink.GotVideoFrame;
             pc.OnVideoFormatsNegotiated += (formats) =>
             {

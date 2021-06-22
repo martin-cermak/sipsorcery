@@ -7,27 +7,28 @@
 // - "Session Description Protocol (SDP) Offer/Answer procedures for
 //   Interactive Connectivity Establishment(ICE)" [ed: specification for
 //   including ICE candidates in SDP]:
-//   https://tools.ietf.org/html/draft-ietf-mmusic-ice-sip-sdp-39
+//   https://tools.ietf.org/html/rfc8839
 // - "Session Description Protocol (SDP) Offer/Answer Procedures For Stream
 //   Control Transmission Protocol(SCTP) over Datagram Transport Layer
 //   Security(DTLS) Transport." [ed: specification for negotiating
 //   data channels in SDP, this defines the SDP "sctp-port" attribute] 
-//   The document is also EXPIRED:
-//   https://tools.ietf.org/html/draft-ietf-mmusic-sctp-sdp-26
+//   https://tools.ietf.org/html/rfc8841
 // - "SDP-based Data Channel Negotiation" [ed: not currently implemented,
 //   actually seems like a big pain to implement this given it can already
 //   be done in-band on the SCTP connection]:
-//   https://tools.ietf.org/html/draft-ietf-mmusic-data-channel-sdpneg-28
+//   https://tools.ietf.org/html/rfc8864
 //
 // Author(s):
-// Aaron Clauson
+// Aaron Clauson (aaron@sipsorcery.com)
 //
 // History:
 // 04 Mar 2016	Aaron Clauson	Created.
 // 25 Aug 2019  Aaron Clauson   Updated from video only to audio and video.
 // 18 Jan 2020  Aaron Clauson   Combined WebRTCPeer and WebRTCSession.
-// 16 Mar 2020  Aaron Clauson   Refactoring to support RTCPeerConnection interface.
+// 16 Mar 2020  Aaron Clauson   Refactored to support RTCPeerConnection interface.
 // 13 Jul 2020  Aaron Clauson   Added data channel support.
+// 22 Mar 2021  Aaron Clauson   Refactored data channels logic for new SCTP
+//                              implementation.
 //
 // License: 
 // BSD 3-Clause "New" or "Revised" License, see included LICENSE.md file.
@@ -37,6 +38,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net;
+using System.Text;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using SIPSorcery.SIP.App;
@@ -150,8 +152,7 @@ namespace SIPSorcery.Net
     /// <remarks>
     /// Interface is defined in https://www.w3.org/TR/webrtc/#interface-definition.
     /// The Session Description offer/answer mechanisms are detailed in
-    /// https://tools.ietf.org/html/draft-ietf-rtcweb-jsep-26 (or later if the
-    /// draft has been updated).
+    /// https://tools.ietf.org/html/rfc8829 "JavaScript Session Establishment Protocol (JSEP)".
     /// </remarks>
     public class RTCPeerConnection : RTPSession, IRTCPeerConnection
     {
@@ -167,9 +168,16 @@ namespace SIPSorcery.Net
         private const string BUNDLE_ATTRIBUTE = "BUNDLE";
         private const string ICE_OPTIONS = "ice2,trickle";          // Supported ICE options.
         private const string NORMAL_CLOSE_REASON = "normal";
-        private const int SCTP_DEFAULT_PORT = 5000;
-        private const long SCTP_DEFAULT_MAX_MESSAGE_SIZE = 262144;
+        private const ushort SCTP_DEFAULT_PORT = 5000;
         private const string UNKNOWN_DATACHANNEL_ERROR = "unknown";
+
+        /// <summary>
+        /// The period to wait for the SCTP association to complete before giving up.
+        /// In theory this should be very quick as the DTLS connection should already have been established
+        /// and the SCTP logic only needs to send the small handshake messages to establish
+        /// the association.
+        /// </summary>
+        private const int SCTP_ASSOCIATE_TIMEOUT_SECONDS = 2;
 
         private new readonly string RTP_MEDIA_PROFILE = RTP_MEDIA_NON_FEEDBACK_PROFILE;
         private readonly string RTCP_ATTRIBUTE = $"a=rtcp:{SDP.IGNORE_RTP_PORT_NUMBER} IN IP4 0.0.0.0";
@@ -187,7 +195,7 @@ namespace SIPSorcery.Net
         private Org.BouncyCastle.Crypto.Tls.Certificate _dtlsCertificate;
         private Org.BouncyCastle.Crypto.AsymmetricKeyParameter _dtlsPrivateKey;
         private DtlsSrtpTransport _dtlsHandle;
-        public RTCPeerSctpAssociation _peerSctpAssociation;
+        private Task _iceGatheringTask;
 
         /// <summary>
         /// Local ICE candidates that have been supplied directly by the application.
@@ -224,11 +232,23 @@ namespace SIPSorcery.Net
 
         public RTCSessionDescription pendingRemoteDescription => null;
 
-        public RTCSignalingState signalingState { get; private set; } = RTCSignalingState.stable;
+        public RTCSignalingState signalingState { get; private set; } = RTCSignalingState.closed;
 
-        public RTCIceGatheringState iceGatheringState { get; private set; } = RTCIceGatheringState.@new;
+        public RTCIceGatheringState iceGatheringState
+        {
+            get
+            {
+                return _rtpIceChannel != null ? _rtpIceChannel.IceGatheringState : RTCIceGatheringState.@new;
+            }
+        }
 
-        public RTCIceConnectionState iceConnectionState { get; private set; } = RTCIceConnectionState.@new;
+        public RTCIceConnectionState iceConnectionState
+        {
+            get
+            {
+                return _rtpIceChannel != null ? _rtpIceChannel.IceConnectionState : RTCIceConnectionState.@new;
+            }
+        }
 
         public RTCPeerConnectionState connectionState { get; private set; } = RTCPeerConnectionState.@new;
 
@@ -254,6 +274,15 @@ namespace SIPSorcery.Net
         /// remote peer.
         /// </summary>
         public RTCDtlsFingerprint DtlsCertificateFingerprint { get; private set; }
+
+        /// <summary>
+        /// The SCTP transport over which SCTP data is sent and received.
+        /// </summary>
+        /// <remarks>
+        /// WebRTC API definition:
+        /// https://www.w3.org/TR/webrtc/#attributes-15
+        /// </remarks>
+        public RTCSctpTransport sctp { get; private set; }
 
         /// <summary>
         /// Informs the application that session negotiation needs to be done (i.e. a createOffer call 
@@ -394,7 +423,6 @@ namespace SIPSorcery.Net
                 _configuration = new RTCConfiguration();
             }
 
-
             if (_dtlsCertificate == null)
             {
                 // No certificate was provided so create a new self signed one.
@@ -420,156 +448,118 @@ namespace SIPSorcery.Net
             OnRtpClosed += Close;
             OnRtcpBye += Close;
 
+            sctp = new RTCSctpTransport(SCTP_DEFAULT_PORT, SCTP_DEFAULT_PORT, _rtpIceChannel.RTPPort);
+
             onnegotiationneeded?.Invoke();
 
-            _rtpIceChannel.StartGathering();
+            // This is the point the ICE session potentially starts contacting STUN and TURN servers.
+            // This job was moved to a background thread as it was observed that interacting with the OS network
+            // calls and/or initialising DNS was taking up to 600ms, see
+            // https://github.com/sipsorcery-org/sipsorcery/issues/456.
+            _iceGatheringTask = Task.Run(_rtpIceChannel.StartGathering);
         }
 
         /// <summary>
         /// Event handler for ICE connection state changes.
         /// </summary>
         /// <param name="state">The new ICE connection state.</param>
-        private async void IceConnectionStateChange(RTCIceConnectionState state)
+        private async void IceConnectionStateChange(RTCIceConnectionState iceState)
         {
-            if (iceConnectionState == RTCIceConnectionState.connected &&
-                state == RTCIceConnectionState.connected)
-            {
-                // Already connected. This event is due to change in the nominated remote candidate.
-                var connectedEP = _rtpIceChannel.NominatedEntry.RemoteCandidate.DestinationEndPoint;
-                base.SetDestination(SDPMediaTypesEnum.audio, connectedEP, connectedEP);
+            oniceconnectionstatechange?.Invoke(iceConnectionState);
 
-                logger.LogInformation($"ICE changing connected remote end point to {AudioDestinationEndPoint}.");
-            }
-            else
+            if (iceState == RTCIceConnectionState.connected && _rtpIceChannel.NominatedEntry != null)
             {
-                if (state == RTCIceConnectionState.connected && _rtpIceChannel.NominatedEntry != null)
+                if (_dtlsHandle != null)
                 {
-                    if (_dtlsHandle != null)
+                    if (base.AudioDestinationEndPoint?.Address.Equals(_rtpIceChannel.NominatedEntry.RemoteCandidate.DestinationEndPoint.Address) == false ||
+                        base.AudioDestinationEndPoint?.Port != _rtpIceChannel.NominatedEntry.RemoteCandidate.DestinationEndPoint.Port)
                     {
-                        // The ICE connection state change is due to a re-connection.
-                        iceConnectionState = state;
-                        oniceconnectionstatechange?.Invoke(iceConnectionState);
-
-                        connectionState = RTCPeerConnectionState.connected;
-                        onconnectionstatechange?.Invoke(connectionState);
-                    }
-                    else
-                    {
+                        // Already connected and this event is due to change in the nominated remote candidate.
                         var connectedEP = _rtpIceChannel.NominatedEntry.RemoteCandidate.DestinationEndPoint;
                         base.SetDestination(SDPMediaTypesEnum.audio, connectedEP, connectedEP);
 
-                        logger.LogInformation($"ICE connected to remote end point {AudioDestinationEndPoint}.");
+                        logger.LogInformation($"ICE changing connected remote end point to {AudioDestinationEndPoint}.");
+                    }
 
-                        _dtlsHandle = new DtlsSrtpTransport(
-                                    IceRole == IceRolesEnum.active ?
-                                    (IDtlsSrtpPeer)new DtlsSrtpClient(_dtlsCertificate, _dtlsPrivateKey) :
-                                    (IDtlsSrtpPeer)new DtlsSrtpServer(_dtlsCertificate, _dtlsPrivateKey));
-
-                        _dtlsHandle.OnAlert += OnDtlsAlert;
-
-                        logger.LogDebug($"Starting DLS handshake with role {IceRole}.");
-
-                        try
-                        {
-                            bool handshakeResult = await Task.Run(() => DoDtlsHandshake(_dtlsHandle)).ConfigureAwait(false);
-
-                            connectionState = (handshakeResult) ? RTCPeerConnectionState.connected : connectionState = RTCPeerConnectionState.failed;
-                            onconnectionstatechange?.Invoke(connectionState);
-
-                            if (connectionState == RTCPeerConnectionState.connected)
-                            {
-                                await base.Start().ConfigureAwait(false);
-
-                                if (RemoteDescription.Media.Any(x => x.Media == SDPMediaTypesEnum.application))
-                                {
-                                    InitialiseSctpAssociation();
-                                }
-                            }
-                        }
-                        catch (Exception excp)
-                        {
-                            logger.LogWarning(excp, $"RTCPeerConnection DTLS handshake failed. {excp.Message}");
-
-                            connectionState = RTCPeerConnectionState.failed;
-                            onconnectionstatechange?.Invoke(connectionState);
-                        }
+                    if (connectionState == RTCPeerConnectionState.disconnected ||
+                        connectionState == RTCPeerConnectionState.failed)
+                    {
+                        // The ICE connection state change is due to a re-connection.
+                        connectionState = RTCPeerConnectionState.connected;
+                        onconnectionstatechange?.Invoke(connectionState);
                     }
                 }
-
-                iceConnectionState = state;
-                oniceconnectionstatechange?.Invoke(iceConnectionState);
-
-                if (iceConnectionState == RTCIceConnectionState.checking)
+                else
                 {
                     connectionState = RTCPeerConnectionState.connecting;
                     onconnectionstatechange?.Invoke(connectionState);
+
+                    var connectedEP = _rtpIceChannel.NominatedEntry.RemoteCandidate.DestinationEndPoint;
+                    base.SetDestination(SDPMediaTypesEnum.audio, connectedEP, connectedEP);
+
+                    logger.LogInformation($"ICE connected to remote end point {AudioDestinationEndPoint}.");
+
+                    bool disableDtlsExtendedMasterSecret = _configuration != null && _configuration.X_DisableExtendedMasterSecretKey;
+                    _dtlsHandle = new DtlsSrtpTransport(
+                                IceRole == IceRolesEnum.active ?
+                                new DtlsSrtpClient(_dtlsCertificate, _dtlsPrivateKey) :
+                                (IDtlsSrtpPeer)new DtlsSrtpServer(_dtlsCertificate, _dtlsPrivateKey)
+                                    { ForceUseExtendedMasterSecret = !disableDtlsExtendedMasterSecret }
+                                );
+
+                    _dtlsHandle.OnAlert += OnDtlsAlert;
+
+                    logger.LogDebug($"Starting DLS handshake with role {IceRole}.");
+
+                    try
+                    {
+                        bool handshakeResult = await Task.Run(() => DoDtlsHandshake(_dtlsHandle)).ConfigureAwait(false);
+
+                        connectionState = (handshakeResult) ? RTCPeerConnectionState.connected : connectionState = RTCPeerConnectionState.failed;
+                        onconnectionstatechange?.Invoke(connectionState);
+
+                        if (connectionState == RTCPeerConnectionState.connected)
+                        {
+                            await base.Start().ConfigureAwait(false);
+                            await InitialiseSctpTransport().ConfigureAwait(false);
+                        }
+                    }
+                    catch (Exception excp)
+                    {
+                        logger.LogWarning(excp, $"RTCPeerConnection DTLS handshake failed. {excp.Message}");
+
+                        //connectionState = RTCPeerConnectionState.failed;
+                        //onconnectionstatechange?.Invoke(connectionState);
+
+                        Close("dtls handshake failed");
+                    }
                 }
-                else if (iceConnectionState == RTCIceConnectionState.disconnected)
+            }
+
+            if (iceConnectionState == RTCIceConnectionState.checking)
+            {
+                // Not sure about this correspondence between the ICE and peer connection states.
+                // TODO: Double check spec.
+                //connectionState = RTCPeerConnectionState.connecting;
+                //onconnectionstatechange?.Invoke(connectionState);
+            }
+            else if (iceConnectionState == RTCIceConnectionState.disconnected)
+            {
+                if (connectionState == RTCPeerConnectionState.connected)
                 {
-                    if (connectionState == RTCPeerConnectionState.connected)
-                    {
-                        connectionState = RTCPeerConnectionState.disconnected;
-                        onconnectionstatechange?.Invoke(connectionState);
-                    }
-                    else
-                    {
-                        connectionState = RTCPeerConnectionState.failed;
-                        onconnectionstatechange?.Invoke(connectionState);
-                    }
+                    connectionState = RTCPeerConnectionState.disconnected;
+                    onconnectionstatechange?.Invoke(connectionState);
                 }
-                else if (iceConnectionState == RTCIceConnectionState.failed)
+                else
                 {
                     connectionState = RTCPeerConnectionState.failed;
                     onconnectionstatechange?.Invoke(connectionState);
                 }
             }
-        }
-
-        /// <summary>
-        /// Initialises the SCTP association and will attempt to create any pending data channel requests.
-        /// </summary>
-        private void InitialiseSctpAssociation()
-        {
-            // If a data channel was requested by the application then create the SCTP association.
-            var sctpAnn = RemoteDescription.Media.Where(x => x.Media == SDPMediaTypesEnum.application).FirstOrDefault();
-            int destinationPort = sctpAnn?.SctpPort != null ? (int)sctpAnn.SctpPort : SCTP_DEFAULT_PORT;
-
-            _peerSctpAssociation = new RTCPeerSctpAssociation(_dtlsHandle.Transport, _dtlsHandle.IsClient, SCTP_DEFAULT_PORT, destinationPort);
-            _peerSctpAssociation.OnAssociated += () =>
+            else if (iceConnectionState == RTCIceConnectionState.failed)
             {
-                logger.LogDebug("SCTP association successfully initialised.");
-
-                // Create new SCTP streams for any outstanding data channel requests.
-                foreach (var dataChannel in DataChannels)
-                {
-                    CreateSctpStreamForDataChannel(dataChannel);
-                }
-            };
-            _peerSctpAssociation.OnSCTPStreamOpen += (stm, isLocal) =>
-            {
-                logger.LogDebug($"SCTP stream opened for label {stm.getLabel()} and stream ID {stm.getNum()} (is local stream ID {isLocal}).");
-
-                if (!isLocal)
-                {
-                    // A new data channel that was opened by the remote peer.
-                    RTCDataChannel dataChannel = new RTCDataChannel
-                    {
-                        label = stm.getLabel(),
-                        id = (ushort)stm.getNum()
-                    };
-                    dataChannel.SetStream(stm);
-                    DataChannels.Add(dataChannel);
-                    ondatachannel?.Invoke(dataChannel);
-                }
-            };
-
-            try
-            {
-                _peerSctpAssociation.Associate();
-            }
-            catch (Exception excp)
-            {
-                logger.LogWarning(excp, $"SCTP exception initialising association. {excp.Message}");
+                connectionState = RTCPeerConnectionState.failed;
+                onconnectionstatechange?.Invoke(connectionState);
             }
         }
 
@@ -585,7 +575,8 @@ namespace SIPSorcery.Net
                 _configuration?.X_BindAddress,
                 RTCIceComponent.rtp,
                 _configuration?.iceServers,
-                _configuration != null ? _configuration.iceTransportPolicy : RTCIceTransportPolicy.all);
+                _configuration != null ? _configuration.iceTransportPolicy : RTCIceTransportPolicy.all,
+                _configuration != null ? _configuration.X_ICEIncludeAllInterfaceAddresses : false);
 
             m_rtpChannels.Add(mediaType, rtpIceChannel);
 
@@ -615,11 +606,16 @@ namespace SIPSorcery.Net
                 _rtpIceChannel.IsController = true;
             }
 
-            // This is the point the ICE session potentially starts contacting STUN and TURN servers.
-            //IceSession.StartGathering();
-
-            signalingState = RTCSignalingState.have_local_offer;
-            onsignalingstatechange?.Invoke();
+            if (signalingState == RTCSignalingState.have_remote_offer)
+            {
+                signalingState = RTCSignalingState.stable;
+                onsignalingstatechange?.Invoke();
+            }
+            else
+            {
+                signalingState = RTCSignalingState.have_local_offer;
+                onsignalingstatechange?.Invoke();
+            }
 
             return Task.CompletedTask;
         }
@@ -758,8 +754,18 @@ namespace SIPSorcery.Net
                     }
                 }
 
-                signalingState = RTCSignalingState.have_remote_offer;
-                onsignalingstatechange?.Invoke();
+                UpdatedSctpDestinationPort();
+
+                if (init.type == RTCSdpType.offer)
+                {
+                    signalingState = RTCSignalingState.have_remote_offer;
+                    onsignalingstatechange?.Invoke();
+                }
+                else
+                {
+                    signalingState = RTCSignalingState.stable;
+                    onsignalingstatechange?.Invoke();
+                }
 
                 // Trigger the ICE candidate events for any non-host candidates, host candidates are always included in the
                 // SDP offer/answer. The reason for the trigger is that ICE candidates cannot be sent to the remote peer
@@ -785,7 +791,11 @@ namespace SIPSorcery.Net
 
                 _rtpIceChannel?.Close();
                 _dtlsHandle?.Close();
-                _peerSctpAssociation?.Close();
+
+                if (sctp != null && sctp.state == RTCSctpTransportState.Connected)
+                {
+                    sctp?.Close();
+                }
 
                 base.Close(reason);
 
@@ -810,7 +820,7 @@ namespace SIPSorcery.Net
         /// </remarks>
         /// <param name="options">Optional. If supplied the options will be sued to apply additional
         /// controls over the generated offer SDP.</param>
-        public RTCSessionDescriptionInit createOffer(RTCOfferOptions options)
+        public RTCSessionDescriptionInit createOffer(RTCOfferOptions options = null)
         {
             var audioCapabilities = AudioLocalTrack?.Capabilities;
             var videoCapabilities = VideoLocalTrack?.Capabilities;
@@ -878,7 +888,7 @@ namespace SIPSorcery.Net
         /// </remarks>
         /// <param name="options">Optional. If supplied the options will be used to apply additional
         /// controls over the generated answer SDP.</param>
-        public RTCSessionDescriptionInit createAnswer(RTCAnswerOptions options)
+        public RTCSessionDescriptionInit createAnswer(RTCAnswerOptions options = null)
         {
             if (remoteDescription == null)
             {
@@ -964,13 +974,20 @@ namespace SIPSorcery.Net
             List<SDPAudioVideoMediaFormat> videoCapabilities,
             bool excludeIceCandidates = false)
         {
+            // Make sure the ICE gathering of local IP addresses is complete.
+            // This task should complete very quickly (<1s) but it is deemed very useful to wait
+            // for it to complete as it allows local ICE candidates to be included in the SDP.
+            // In theory it would be better to an async/await but that would result in a breaking
+            // change to the API and for a one off (once per class instance not once per method call)
+            // delay of a few hundred milliseconds it was decided not to break the API.
+            _iceGatheringTask.Wait();
+
             SDP offerSdp = new SDP(IPAddress.Loopback);
             offerSdp.SessionId = LocalSdpSessionID;
 
+            string dtlsFingerprint = this.DtlsCertificateFingerprint.ToString();
             bool iceCandidatesAdded = false;
             int mediaIndex = 0;
-
-            offerSdp.DtlsFingerprint = this.DtlsCertificateFingerprint.ToString();
 
             // Local function to add ICE candidates to one of the media announcements.
             void AddIceCandidates(SDPMediaAnnouncement announcement)
@@ -1024,7 +1041,7 @@ namespace SIPSorcery.Net
                     announcement.IceUfrag = _rtpIceChannel.LocalIceUser;
                     announcement.IcePwd = _rtpIceChannel.LocalIcePassword;
                     announcement.IceOptions = ICE_OPTIONS;
-                    announcement.DtlsFingerprint = offerSdp.DtlsFingerprint;
+                    announcement.DtlsFingerprint = dtlsFingerprint;
 
                     if (iceCandidatesAdded == false && !excludeIceCandidates)
                     {
@@ -1065,13 +1082,13 @@ namespace SIPSorcery.Net
                     dataChannelAnnouncement.Connection = new SDPConnectionInformation(IPAddress.Any);
 
                     dataChannelAnnouncement.SctpPort = SCTP_DEFAULT_PORT;
-                    dataChannelAnnouncement.MaxMessageSize = SCTP_DEFAULT_MAX_MESSAGE_SIZE;
+                    dataChannelAnnouncement.MaxMessageSize = sctp.maxMessageSize;
                     dataChannelAnnouncement.MLineIndex = mindex;
                     dataChannelAnnouncement.MediaID = mindex.ToString();
                     dataChannelAnnouncement.IceUfrag = _rtpIceChannel.LocalIceUser;
                     dataChannelAnnouncement.IcePwd = _rtpIceChannel.LocalIcePassword;
                     dataChannelAnnouncement.IceOptions = ICE_OPTIONS;
-                    dataChannelAnnouncement.DtlsFingerprint = offerSdp.DtlsFingerprint;
+                    dataChannelAnnouncement.DtlsFingerprint = dtlsFingerprint;
 
                     if (iceCandidatesAdded == false && !excludeIceCandidates)
                     {
@@ -1113,7 +1130,7 @@ namespace SIPSorcery.Net
         {
             //logger.LogDebug($"RTP channel received a packet from {remoteEP}, {buffer?.Length} bytes.");
 
-            // By this pint the RTP ICE channel has already processed any STUN packets which means 
+            // By this point the RTP ICE channel has already processed any STUN packets which means 
             // it's only necessary to separate RTP/RTCP from DTLS.
             // Because DTLS packets can be fragmented and RTP/RTCP should never be use the RTP/RTCP 
             // prefix to distinguish.
@@ -1210,67 +1227,285 @@ namespace SIPSorcery.Net
         }
 
         /// <summary>
+        /// Once the SDP exchange has been made the SCTP transport ports are known. If the destination
+        /// port is not using the default value attempt to update it on teh SCTP transprot.
+        /// </summary>
+        private void UpdatedSctpDestinationPort()
+        {
+            // If a data channel was requested by the application then create the SCTP association.
+            var sctpAnn = RemoteDescription.Media.Where(x => x.Media == SDPMediaTypesEnum.application).FirstOrDefault();
+            ushort destinationPort = sctpAnn?.SctpPort != null ? sctpAnn.SctpPort.Value : SCTP_DEFAULT_PORT;
+
+            if (destinationPort != SCTP_DEFAULT_PORT)
+            {
+                sctp.UpdateDestinationPort(destinationPort);
+            }
+        }
+
+        /// <summary>
+        /// Initialises the SCTP transport. This will result in the DTLS SCTP transport listening 
+        /// for incoming INIT packets if the remote peer attempts to create the association. The local
+        /// peer will NOT attempt to establish the association at this point. It's up to the
+        /// application to specify it wants a data channel to initiate the SCTP association attempt.
+        /// </summary>
+        private async Task InitialiseSctpTransport()
+        {
+            try
+            {
+                sctp.OnStateChanged += OnSctpTransportStateChanged;
+                sctp.Start(_dtlsHandle.Transport, _dtlsHandle.IsClient);
+
+                if (DataChannels.Count > 0)
+                {
+                    await InitialiseSctpAssociation().ConfigureAwait(false);
+                }
+            }
+            catch (Exception excp)
+            {
+                logger.LogError($"SCTP exception establishing association, data channels will not be available. {excp}");
+                sctp?.Close();
+            }
+        }
+
+        /// <summary>
+        /// Event handler for changes to the SCTP transport state.
+        /// </summary>
+        /// <param name="state">The new transport state.</param>
+        private void OnSctpTransportStateChanged(RTCSctpTransportState state)
+        {
+            if (state == RTCSctpTransportState.Connected)
+            {
+                logger.LogDebug("SCTP transport successfully connected.");
+
+                sctp.RTCSctpAssociation.OnDataChannelData += OnSctpAssociationDataChunk;
+                sctp.RTCSctpAssociation.OnDataChannelOpened += OnSctpAssociationDataChannelOpened;
+                sctp.RTCSctpAssociation.OnNewDataChannel += OnSctpAssociationNewDataChannel;
+
+                // Create new SCTP streams for any outstanding data channel requests.
+                foreach (var dataChannel in DataChannels)
+                {
+                    OpenDataChannel(dataChannel);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Event handler for a new data channel being opened by the remote peer.
+        /// </summary>
+        private void OnSctpAssociationNewDataChannel(ushort streamID, DataChannelTypes type, ushort priority, uint reliability, string label, string protocol)
+        {
+            logger.LogInformation($"WebRTC new data channel opened by remote peer for stream ID {streamID}, type {type}, " +
+                $"priority {priority}, reliability {reliability}, label {label}, protocol {protocol}.");
+
+            // TODO: Set reliability, priority etc. properties on the data channel.
+            var dc = new RTCDataChannel(sctp) { id = streamID, label = label, IsOpened = true, readyState = RTCDataChannelState.open };
+
+            dc.SendDcepAck();
+
+            if (DataChannels.Any(x => x.id == streamID))
+            {
+                // TODO: What's the correct behaviour here?? I guess use the newest one and remove the old one?
+                logger.LogWarning($"WebRTC duplicate data channel requested for stream ID {streamID}.");
+            }
+            else
+            {
+                DataChannels.Add(dc);
+
+                ondatachannel?.Invoke(dc);
+            }
+        }
+
+        /// <summary>
+        /// Event handler for the confirmation that a data channel opened by this peer has been acknowledged.
+        /// </summary>
+        /// <param name="streamID">The ID of the stream corresponding to the acknowledged data channel.</param>
+        private void OnSctpAssociationDataChannelOpened(ushort streamID)
+        {
+            var dc = DataChannels.FirstOrDefault(x => x.id == streamID);
+
+            string label = dc != null ? dc.label : "<none>";
+            logger.LogInformation($"WebRTC data channel opened label {label} and stream ID {streamID}.");
+
+            if (dc != null)
+            { 
+                dc.GotAck();
+            }
+            else
+            {
+                logger.LogWarning($"WebRTC data channel got ACK but data channel not found for stream ID {streamID}.");
+            }
+        }
+
+        /// <summary>
+        /// Event handler for an SCTP DATA chunk being received on the SCTP association.
+        /// </summary>
+        /// <param name="streamID">The stream ID of the chunk.</param>
+        /// <param name="streamSeqNum">The stream sequence number of the chunk. Will be 0 for unordered streams.</param>
+        /// <param name="ppID">The payload protocol ID for the chunk.</param>
+        /// <param name="data">The chunk data.</param>
+        private void OnSctpAssociationDataChunk(SctpDataFrame frame)
+        {
+            // Should only be one channel per stream ID but no point blowing up if a duplicate
+            // was created by the remote peer or it snuck in some other way.
+            var dc = DataChannels.FirstOrDefault(x => x.id == frame.StreamID);
+
+            if (dc != null)
+            {
+                dc.GotData(frame.StreamID, frame.StreamSeqNum, frame.PPID, frame.UserData);
+            }
+            else
+            {
+                logger.LogWarning($"WebRTC data channel got data but no channel found for stream ID {frame.StreamID}.");
+            }
+        }
+
+        /// <summary>
+        /// When a data channel is requested an SCTP association is needed. This method attempts to 
+        /// initialise the association if it is not already available.
+        /// </summary>
+        private async Task InitialiseSctpAssociation()
+        {
+            if (sctp.RTCSctpAssociation.State != SctpAssociationState.Established)
+            {
+                sctp.Associate();
+            }
+
+            if (sctp.state != RTCSctpTransportState.Connected)
+            {
+                TaskCompletionSource<bool> onSctpConnectedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                sctp.OnStateChanged += (state) =>
+                {
+                    logger.LogDebug($"SCTP transport for create data channel request changed to state {state}.");
+
+                    if (state == RTCSctpTransportState.Connected)
+                    {
+                        onSctpConnectedTcs.TrySetResult(true);
+                    }
+                };
+
+                DateTime startTime = DateTime.Now;
+
+                var completedTask = await Task.WhenAny(onSctpConnectedTcs.Task, Task.Delay(SCTP_ASSOCIATE_TIMEOUT_SECONDS * 1000)).ConfigureAwait(false);
+
+                if (sctp.state != RTCSctpTransportState.Connected)
+                {
+                    var duration = DateTime.Now.Subtract(startTime).TotalMilliseconds;
+
+                    if (completedTask != onSctpConnectedTcs.Task)
+                    {
+                        throw new ApplicationException($"SCTP association timed out after {duration:0.##}ms with association in state {sctp.RTCSctpAssociation.State} when attempting to create a data channel.");
+                    }
+                    else
+                    {
+                        throw new ApplicationException($"SCTP association failed after {duration:0.##}ms with association in state {sctp.RTCSctpAssociation.State} when attempting to create a data channel.");
+                    }
+                }
+            }
+        }
+
+        /// <summary>
         /// Adds a new data channel to the peer connection.
         /// </summary>
-        /// <param name="label">THe label used to identify the data channel.</param>
+        /// <remarks>
+        /// WebRTC API definition:
+        /// https://www.w3.org/TR/webrtc/#methods-11
+        /// </remarks>
+        /// <param name="label">The label used to identify the data channel.</param>
         /// <returns>The data channel created.</returns>
-        public RTCDataChannel createDataChannel(string label, RTCDataChannelInit init)
+        public async Task<RTCDataChannel> createDataChannel(string label, RTCDataChannelInit init = null)
         {
             logger.LogDebug($"Data channel create request for label {label}.");
 
-            RTCDataChannel channel = new RTCDataChannel
+            RTCDataChannel channel = new RTCDataChannel(sctp, init)
             {
                 label = label,
             };
 
             DataChannels.Add(channel);
 
-            // If the SCTP association is ready attempt to create a new SCTP stream for the data channel.
-            // If the association is not ready the stream creation attempt will be triggered once it is.
-            if (_peerSctpAssociation != null && _peerSctpAssociation.IsAssociated)
+            if (connectionState == RTCPeerConnectionState.connected)
             {
-                CreateSctpStreamForDataChannel(channel);
-            }
+                // If the peer connection is not in a connected state there's no point doing anything
+                // with the SCTP transport. If the peer connection does connect then a check will
+                // be made for any pending data channels and the SCTP operations will be done then.
 
-            return channel;
-        }
-
-        /// <summary>
-        /// Attempts to create and wire up the SCTP stream for a data channel.
-        /// </summary>
-        /// <param name="dataChannel">The data channel to create the SCTP stream for.</param>
-        /// <returns>The Task being used to create the SCTP stream.</returns>
-        private void CreateSctpStreamForDataChannel(RTCDataChannel dataChannel)
-        {
-            logger.LogDebug($"Attempting to create SCTP stream for data channel with label {dataChannel.label}.");
-
-            Task.Run(() =>
-            {
-                return _peerSctpAssociation.CreateStream(dataChannel.label);
-            })
-            .ContinueWith(
-                (t) =>
+                if (sctp == null || sctp.state != RTCSctpTransportState.Connected)
                 {
-                    if (t.IsFaulted)
+                    throw new ApplicationException("No SCTP transport is available.");
+                }
+                else
+                {
+                    if (sctp.RTCSctpAssociation == null ||
+                        sctp.RTCSctpAssociation.State != SctpAssociationState.Established)
                     {
-                        if (t.Exception != null)
-                        {
-                            logger.LogWarning($"Exception creating data channel {t.Exception.Flatten().Message}");
-                            dataChannel.SetError(t.Exception.InnerExceptions.First().Message);
-                        }
-                        else
-                        {
-                            logger.LogWarning($"Unable to create a data channel.");
-                            dataChannel.SetError(UNKNOWN_DATACHANNEL_ERROR);
-                        }
+                        await InitialiseSctpAssociation().ConfigureAwait(false);
+                    }
+
+                    OpenDataChannel(channel);
+
+                    // Wait for the DCEP ACK from the remote peer.
+                    TaskCompletionSource<string> isopen = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    channel.onopen += () => isopen.TrySetResult(string.Empty);
+                    channel.onerror += (err) => isopen.TrySetResult(err);
+                    var error = await isopen.Task.ConfigureAwait(false);
+
+                    if (error != string.Empty)
+                    {
+                        throw new ApplicationException($"Data channel creation failed with: {error}");
                     }
                     else
                     {
-                        logger.LogDebug($"SCTP stream successfully initialised for data channel with label {dataChannel.label}.");
-                        dataChannel.SetStream(t.Result);
+                        return channel;
                     }
-                })
-            .ConfigureAwait(false);
+                }
+            }
+            else
+            {
+                // Data channels can be created prior to the SCTP transport being available.
+                // They will act as placeholders and then be opened once the SCTP transport 
+                // becomes available.
+                return channel;
+            }
+        }
+
+        /// <summary>
+        /// Sends the Data Channel Establishment Protocol (DCEP) OPEN message to configure the data
+        /// channel on the remote peer.
+        /// </summary>
+        /// <param name="dataChannel">The data channel to open.</param>
+        private void OpenDataChannel(RTCDataChannel dataChannel)
+        {
+            logger.LogDebug($"WebRTC attempting to open data channel with label {dataChannel.label}.");
+
+            // Get next available stream ID.
+            bool eventStreamID = _dtlsHandle.IsClient;
+            var lastAssignedDC = DataChannels.Where(x => x.id != null && x.id % 2 == (eventStreamID ? 0 : 1))
+                .OrderByDescending(x => x.id.GetValueOrDefault()).FirstOrDefault();
+            bool canCreateStream = true;
+            ushort nextID = (ushort)(eventStreamID ? 0 : 1);
+            if(lastAssignedDC != null)
+            {
+                //  The SCTP stream identifier 65535 is reserved due to SCTP INIT and
+                // INIT - ACK chunks only allowing a maximum of 65535 streams to be
+                // negotiated(0 - 65534) - https://tools.ietf.org/html/rfc8832
+                if (lastAssignedDC.id.Value == ushort.MaxValue - 1 || lastAssignedDC.id.Value == ushort.MaxValue - 2)
+                {
+                    logger.LogError("Data channel stream IDs have been exhausted. No more streams can be created on this data channel.");
+                    canCreateStream = false;
+                }
+                else
+                {
+                    nextID = (ushort)(lastAssignedDC.id.Value + 2);
+                }
+            }
+
+            if (canCreateStream)
+            {
+                logger.LogDebug($"WebRTC setting stream ID to {nextID} for data channel {dataChannel.label}.");
+
+                dataChannel.id = nextID;
+                dataChannel.SendDcepOpen();
+            }
         }
 
         /// <summary>
@@ -1280,7 +1515,7 @@ namespace SIPSorcery.Net
         ///  or DtlsSrtpServer to work.
         /// </summary>
         /// <param name="dtlsHandle">The DTLS transport handle to perform the handshake with.</param>
-        /// <returns></returns>
+        /// <returns>True if the DTLS handshake is successful or false if not.</returns>
         private bool DoDtlsHandshake(DtlsSrtpTransport dtlsHandle)
         {
             logger.LogDebug("RTCPeerConnection DoDtlsHandshake started.");
@@ -1289,15 +1524,17 @@ namespace SIPSorcery.Net
 
             dtlsHandle.OnDataReady += (buf) =>
             {
-                //logger.LogDebug($"DTLS transport sending {buf.Length} bytes to {AudioDestinationEndPoint}.");
-                rtpChannel.Send(RTPChannelSocketsEnum.RTP, AudioDestinationEndPoint, buf);
+                    //logger.LogDebug($"DTLS transport sending {buf.Length} bytes to {AudioDestinationEndPoint}.");
+                    rtpChannel.Send(RTPChannelSocketsEnum.RTP, AudioDestinationEndPoint, buf);
             };
 
-            var handshakeResult = dtlsHandle.DoHandshake();
+            var handshakeResult = dtlsHandle.DoHandshake(out var handshakeError);
 
             if (!handshakeResult)
             {
-                logger.LogWarning($"RTCPeerConnection DTLS handshake failed.");
+                handshakeError = handshakeError ?? "unknown";
+                logger.LogWarning($"RTCPeerConnection DTLS handshake failed with error {handshakeError}.");
+                Close("dtls handshake failed");
                 return false;
             }
             else
@@ -1310,6 +1547,7 @@ namespace SIPSorcery.Net
                 if (remoteFingerprint.value?.ToUpper() != expectedFp.value?.ToUpper())
                 {
                     logger.LogWarning($"RTCPeerConnection remote certificate fingerprint mismatch, expected {expectedFp}, actual {remoteFingerprint}.");
+                    Close("dtls fingerprint mismatch");
                     return false;
                 }
                 else
@@ -1337,14 +1575,15 @@ namespace SIPSorcery.Net
         {
             if (alertType == AlertTypesEnum.close_notify)
             {
-                logger.LogDebug($"SCTP closing association as a result of DTLS transport closure.");
+                logger.LogDebug($"SCTP closing transport as a result of DTLS close notification.");
 
                 // No point keeping the SCTP association open if there is no DTLS transport available.
-                _peerSctpAssociation.Close();
+                sctp?.Close();
             }
             else
             {
-                logger.LogWarning($"DTLS unexpected {alertLevel} alert {alertType}: {alertDescription}");
+                string alertMsg = !string.IsNullOrEmpty(alertDescription) ? $": {alertDescription}" : ".";
+                logger.LogWarning($"DTLS unexpected {alertLevel} alert {alertType}{alertMsg}");
             }
         }
 

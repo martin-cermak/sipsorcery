@@ -249,6 +249,22 @@ namespace SIPSorcery.Net
         public List<RTCCertificate> certificates;
 
         /// <summary>
+        /// The Bouncy Castle DTLS logic enforces the use of Extended Master 
+        /// Secret Keys as per RFC7627. Some WebRTC implementations do not support
+        /// Extended Master Secret Keys (for example Kurento in Mar 2021) and this 
+        /// configuration option is made available for cases where an application
+        /// explicitly decides it's acceptable to disable them.
+        /// </summary>
+        /// <remarks>
+        /// From  https://tools.ietf.org/html/rfc7627#section-4:
+        /// "Clients and servers SHOULD NOT accept handshakes that do not use the
+        /// extended master secret, especially if they rely on features like
+        /// compound authentication that fall into the vulnerable cases described
+        /// in Section 6.1."
+        /// </remarks>
+        public bool X_DisableExtendedMasterSecretKey;
+
+        /// <summary>
         /// Size of the pre-fetched ICE pool. Defaults to 0.
         /// </summary>
         public int iceCandidatePoolSize = 0;
@@ -266,6 +282,18 @@ namespace SIPSorcery.Net
         /// UDP/TLS/RTP/SAVPF instead of UDP/TLS/RTP/SAVP.
         /// </summary>
         public bool X_UseRtpFeedbackProfile;
+
+        /// <summary>
+        /// When gathering host ICE candidates for the local machine the default behaviour is
+        /// to only use IP addresses on the interface that the OS routing table selects to connect
+        /// to the destination, or the Internet facing interface if the destination is unknown.
+        /// This default behaviour is to shield the leaking of all local IP addresses into ICE 
+        /// candidates. In some circumstances, and after weighing up the security concerns, 
+        /// it's very useful to include all interfaces in when generating the address list. 
+        /// Setting this parameter to true will cause all interfaces to be used irrespective of 
+        /// the destination address
+        /// </summary>
+        public bool X_ICEIncludeAllInterfaceAddresses;
     }
 
     /// <summary>

@@ -20,6 +20,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
@@ -76,6 +77,10 @@ namespace SIPSorcery.Examples
         [Option("accepticetypes", Required = false,
             HelpText = "Only accept ICE candidates of these types from the remote peer and ignore any others. Format \"--accepticetypes=(host|srflx|relay)\".")]
         public string AcceptIceTypes { get; set; }
+
+        [Option("echo", Required = false,
+             HelpText = "Acts a client peer for a WebRTC echo server (see https://github.com/sipsorcery/webrtc-echoes). Format \"--echo 'http://localhost:8080/offer\".")]
+        public string EchoServer { get; set; }
     }
 
     class Program
@@ -267,6 +272,33 @@ namespace SIPSorcery.Examples
                 }
                 await webrtcRestPeer.Start(exitCts);
             }
+            else if (options.EchoServer != null)
+            {
+                // Create offer and send to echo server.
+                var pc = await Createpc(null, _stunServer, _relayOnly);
+
+                var signaler = new HttpClient();
+
+                var offer = pc.createOffer(null);
+                await pc.setLocalDescription(offer);
+
+                var content = new StringContent(offer.toJSON(), Encoding.UTF8, "application/json");
+                var response = await signaler.PostAsync($"{options.EchoServer}", content);
+                var answerStr = await response.Content.ReadAsStringAsync();
+
+                if (RTCSessionDescriptionInit.TryParse(answerStr, out var answerInit))
+                {
+                    var setAnswerResult = pc.setRemoteDescription(answerInit);
+                    if (setAnswerResult != SetDescriptionResultEnum.OK)
+                    {
+                        Console.WriteLine($"Set remote description failed {setAnswerResult}.");
+                    }
+                }
+                else
+                {
+                    Console.WriteLine("Failed to parse SDP answer from echo server.");
+                }
+            }
 
             _ = Task.Run(() => ProcessInput(exitCts));
 
@@ -294,7 +326,7 @@ namespace SIPSorcery.Examples
         /// This application spits out a lot of log messages. In an attempt to make command entry slightly more usable
         /// this method attempts to always write the current command input as the bottom line on the console output.
         /// </summary>
-        private static void ProcessInput(CancellationTokenSource cts)
+        private async static Task ProcessInput(CancellationTokenSource cts)
         {
             // Local function to write the current command in the process of being entered.
             Action<int, string> writeCommandPrompt = (lastPromptRow, cmd) =>
@@ -354,8 +386,8 @@ namespace SIPSorcery.Examples
                                     {
                                         Console.WriteLine();
                                         Console.WriteLine($"Creating data channel for label {label}.");
-                                        var dc = _peerConnection.createDataChannel(label, null);
-                                        dc.onmessage += (msg) => logger.LogDebug($" data channel message received on {label}: {msg}");
+                                        var dc = await _peerConnection.createDataChannel(label, null);
+                                        dc.onmessage += (dc, protocol, data) => logger.LogDebug($" data channel message received on {label}: {Encoding.UTF8.GetString(data)}");
                                     }
                                     else
                                     {
@@ -476,7 +508,7 @@ namespace SIPSorcery.Examples
 
         private static Task<RTCPeerConnection> CreatePeerConnection()
         {
-            return Createpc(null, _stunServer, false);
+            return Createpc(null, _stunServer, _relayOnly);
         }
 
         private static Task<RTCPeerConnection> Createpc(WebSocketContext context, RTCIceServer stunServer, bool relayOnly)
@@ -508,8 +540,8 @@ namespace SIPSorcery.Examples
             _peerConnection.GetRtpChannel().MdnsResolve = MdnsResolve;
             //_peerConnection.GetRtpChannel().OnStunMessageReceived += (msg, ep, isrelay) => logger.LogDebug($"STUN message received from {ep}, message type {msg.Header.MessageType}.");
 
-            //var dc = _peerConnection.createDataChannel(DATA_CHANNEL_LABEL, null);
-            //dc.onmessage += (msg) => logger.LogDebug($"data channel receive ({dc.label}-{dc.id}): {msg}");
+            var dc = _peerConnection.createDataChannel(DATA_CHANNEL_LABEL, null);
+            //dc. += (msg) => logger.LogDebug($"data channel receive ({dc.label}-{dc.id}): {msg}");
 
             // Add a send-only audio track (this doesn't require any native libraries for encoding so is good for x-platform testing).
             AudioExtrasSource audioSource = new AudioExtrasSource(new AudioEncoder(), new AudioSourceOptions { AudioSource = AudioSourcesEnum.Music });
@@ -521,6 +553,7 @@ namespace SIPSorcery.Examples
             _peerConnection.OnAudioFormatsNegotiated += (formats) =>
                 audioSource.SetAudioSourceFormat(formats.First());
 
+            _peerConnection.onicecandidate += (candidate) => logger.LogDebug($"onicecandidate {candidate}");
             _peerConnection.onicecandidateerror += (candidate, error) => logger.LogWarning($"Error adding remote ICE candidate. {error} {candidate}");
             _peerConnection.onconnectionstatechange += async (state) =>
             {
@@ -540,8 +573,8 @@ namespace SIPSorcery.Examples
                     await audioSource.CloseAudio();
                 }
             };
-            _peerConnection.OnReceiveReport += (re, media, rr) => logger.LogDebug($"RTCP Receive for {media} from {re}\n{rr.GetDebugSummary()}");
-            _peerConnection.OnSendReport += (media, sr) => logger.LogDebug($"RTCP Send for {media}\n{sr.GetDebugSummary()}");
+            //_peerConnection.OnReceiveReport += (re, media, rr) => logger.LogDebug($"RTCP Receive for {media} from {re}\n{rr.GetDebugSummary()}");
+            //_peerConnection.OnSendReport += (media, sr) => logger.LogDebug($"RTCP Send for {media}\n{sr.GetDebugSummary()}");
             _peerConnection.OnRtcpBye += (reason) => logger.LogDebug($"RTCP BYE receive, reason: {(string.IsNullOrWhiteSpace(reason) ? "<none>" : reason)}.");
 
             // Peer ICE connection state changes are for ICE events such as the STUN checks completing.
@@ -550,20 +583,30 @@ namespace SIPSorcery.Examples
             _peerConnection.ondatachannel += (dc) =>
             {
                 logger.LogDebug($"Data channel opened by remote peer, label {dc.label}, stream ID {dc.id}.");
-                dc.onmessage += (msg) =>
+                dc.onmessage += (dc, protocol, data) =>
                 {
-                    logger.LogDebug($"data channel ({dc.label}:{dc.id}): {msg}.");
+                    if (protocol == DataChannelPayloadProtocols.WebRTC_String ||
+                        protocol == DataChannelPayloadProtocols.WebRTC_String_Partial)
+                    {
+                        logger.LogDebug($"data channel ({dc.label}:{dc.id}): {Encoding.UTF8.GetString(data)}.");
+                        dc.send($"echo: {Encoding.UTF8.GetString(data)}");
+                    }
+                    else
+                    {
+                        logger.LogDebug($"data channel ({dc.label}:{dc.id}): received {dc.protocol} message, length {data?.Length} bytes.");
+                    }
                 };
             };
 
             _peerConnection.onsignalingstatechange += () =>
             {
-                if(_peerConnection.signalingState == RTCSignalingState.have_remote_offer)
+                if (_peerConnection.signalingState == RTCSignalingState.have_remote_offer
+                    || _peerConnection.signalingState == RTCSignalingState.stable)
                 {
                     logger.LogDebug("Remote SDP:");
                     logger.LogDebug(_peerConnection.remoteDescription.sdp.ToString());
                 }
-                else if(_peerConnection.signalingState == RTCSignalingState.have_local_offer)
+                else if (_peerConnection.signalingState == RTCSignalingState.have_local_offer)
                 {
                     logger.LogDebug("Local SDP:");
                     logger.LogDebug(_peerConnection.localDescription.sdp.ToString());

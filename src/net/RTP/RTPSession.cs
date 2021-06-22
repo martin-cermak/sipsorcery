@@ -138,13 +138,13 @@ namespace SIPSorcery.Net
         /// srtp_protect():
         /// @warning This function assumes that it can write SRTP_MAX_TRAILER_LEN
         /// into the location in memory immediately following the RTP packet.
-        /// Callers MUST ensure that this much writable memory is available in
+        /// Callers MUST ensure that this much writeable memory is available in
         /// the buffer that holds the RTP packet.
         /// 
         /// srtp_protect_rtcp():
         /// @warning This function assumes that it can write SRTP_MAX_TRAILER_LEN+4
         /// to the location in memory immediately following the RTCP packet.
-        /// Callers MUST ensure that this much writable memory is available in
+        /// Callers MUST ensure that this much writeable memory is available in
         /// the buffer that holds the RTCP packet.
         /// </summary>
         public const int SRTP_MAX_PREFIX_LENGTH = 148;
@@ -156,6 +156,13 @@ namespace SIPSorcery.Net
         private const int SDP_SESSIONID_LENGTH = 10;             // The length of the pseudo-random string to use for the session ID.
         public const int DTMF_EVENT_DURATION = 1200;            // Default duration for a DTMF event.
         public const int DTMF_EVENT_PAYLOAD_ID = 101;
+
+        /// <summary>
+        /// When there are no RTP packets being sent for an audio or video stream webrtc.lib
+        /// still sends RTCP Receiver Reports with this hard coded SSRC. No doubt it's defined
+        /// in an RFC somewhere but I wasn't able to find it from a quick search.
+        /// </summary>
+        public const uint RTCP_RR_NOSTREAM_SSRC = 4195875351U;
 
         private static ILogger logger = Log.Logger;
 
@@ -586,7 +593,7 @@ namespace SIPSorcery.Net
 
                 // Pre-flight checks have passed. Move onto matching up the local and remote media streams.
                 IPAddress connectionAddress = null;
-                if (sessionDescription.Connection != null && !String.IsNullOrEmpty(sessionDescription.Connection.ConnectionAddress))
+                if (sessionDescription.Connection != null && !string.IsNullOrEmpty(sessionDescription.Connection.ConnectionAddress))
                 {
                     connectionAddress = IPAddress.Parse(sessionDescription.Connection.ConnectionAddress);
                 }
@@ -683,10 +690,14 @@ namespace SIPSorcery.Net
                     // If we get to here then the remote description was compatible with the local media tracks.
                     // Set the remote description and end points.
                     RemoteDescription = sessionDescription;
-                    AudioDestinationEndPoint = remoteAudioRtpEP ?? AudioDestinationEndPoint;
-                    AudioControlDestinationEndPoint = remoteAudioRtcpEP ?? AudioControlDestinationEndPoint;
-                    VideoDestinationEndPoint = remoteVideoRtpEP ?? VideoDestinationEndPoint;
-                    VideoControlDestinationEndPoint = remoteVideoRtcpEP ?? VideoControlDestinationEndPoint;
+                    AudioDestinationEndPoint = 
+                        (remoteAudioRtpEP != null && remoteAudioRtpEP.Port != SDP.IGNORE_RTP_PORT_NUMBER) ? remoteAudioRtpEP : AudioDestinationEndPoint;
+                    AudioControlDestinationEndPoint =
+                        (remoteAudioRtcpEP != null && remoteAudioRtcpEP.Port != SDP.IGNORE_RTP_PORT_NUMBER) ? remoteAudioRtcpEP : AudioControlDestinationEndPoint;
+                    VideoDestinationEndPoint =
+                        (remoteVideoRtpEP != null && remoteVideoRtpEP.Port != SDP.IGNORE_RTP_PORT_NUMBER) ? remoteVideoRtpEP : VideoDestinationEndPoint;
+                    VideoControlDestinationEndPoint =
+                         (remoteVideoRtcpEP != null && remoteVideoRtcpEP.Port != SDP.IGNORE_RTP_PORT_NUMBER) ? remoteVideoRtcpEP : VideoControlDestinationEndPoint;
 
                     return SetDescriptionResultEnum.OK;
                 }
@@ -1335,11 +1346,10 @@ namespace SIPSorcery.Net
                         int markerBit = 0;
 
                         var audioRtpChannel = GetRtpChannel(SDPMediaTypesEnum.audio);
-                        SendRtpPacket(audioRtpChannel, AudioDestinationEndPoint, payload, payloadTimestamp, markerBit, payloadTypeID, audioTrack.Ssrc, audioTrack.SeqNum, AudioRtcpSession);
+                        SendRtpPacket(audioRtpChannel, AudioDestinationEndPoint, payload, payloadTimestamp, markerBit, payloadTypeID, audioTrack.Ssrc, audioTrack.GetNextSeqNum(), AudioRtcpSession);
 
                         //logger.LogDebug($"send audio { audioRtpChannel.RTPLocalEndPoint}->{AudioDestinationEndPoint}.");
 
-                        audioTrack.SeqNum = (audioTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(audioTrack.SeqNum + 1);
                         payloadDuration = (uint)(((decimal)payloadLength / buffer.Length) * duration); // Get the percentage duration of this payload.
                     }
 
@@ -1396,10 +1406,8 @@ namespace SIPSorcery.Net
 
                         var videoChannel = GetRtpChannel(SDPMediaTypesEnum.video);
 
-                        SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.SeqNum, VideoRtcpSession);
+                        SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.GetNextSeqNum(), VideoRtcpSession);
                         //logger.LogDebug($"send VP8 {videoChannel.RTPLocalEndPoint}->{dstEndPoint} timestamp {videoTrack.Timestamp}, sample length {buffer.Length}.");
-
-                        videoTrack.SeqNum = (videoTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(videoTrack.SeqNum + 1);
                     }
 
                     videoTrack.Timestamp += duration;
@@ -1455,9 +1463,7 @@ namespace SIPSorcery.Net
                         packetPayload.AddRange(jpegBytes.Skip(index * RTP_MAX_PAYLOAD).Take(payloadLength));
 
                         int markerBit = ((index + 1) * RTP_MAX_PAYLOAD < jpegBytes.Length) ? 0 : 1;
-                        SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.video), dstEndPoint, packetPayload.ToArray(), videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.SeqNum, VideoRtcpSession);
-
-                        videoTrack.SeqNum = (videoTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(videoTrack.SeqNum + 1);
+                        SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.video), dstEndPoint, packetPayload.ToArray(), videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.GetNextSeqNum(), VideoRtcpSession);
                     }
 
                     videoTrack.Timestamp += duration;
@@ -1536,11 +1542,9 @@ namespace SIPSorcery.Net
 
                 var videoChannel = GetRtpChannel(SDPMediaTypesEnum.video);
 
-                SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.SeqNum, VideoRtcpSession);
+                SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.GetNextSeqNum(), VideoRtcpSession);
                 //logger.LogDebug($"send H264 {videoChannel.RTPLocalEndPoint}->{dstEndPoint} timestamp {videoTrack.Timestamp}, payload length {payload.Length}, seqnum {videoTrack.SeqNum}, marker {markerBit}.");
                 //logger.LogDebug($"send H264 {videoChannel.RTPLocalEndPoint}->{dstEndPoint} timestamp {videoTrack.Timestamp}, STAP-A {h264RtpHdr.HexStr()}, payload length {payload.Length}, seqnum {videoTrack.SeqNum}, marker {markerBit}.");
-
-                videoTrack.SeqNum = (videoTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(videoTrack.SeqNum + 1);
             }
             else
             {
@@ -1564,10 +1568,8 @@ namespace SIPSorcery.Net
 
                     var videoChannel = GetRtpChannel(SDPMediaTypesEnum.video);
 
-                    SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.SeqNum, VideoRtcpSession);
+                    SendRtpPacket(videoChannel, dstEndPoint, payload, videoTrack.Timestamp, markerBit, payloadTypeID, videoTrack.Ssrc, videoTrack.GetNextSeqNum(), VideoRtcpSession);
                     //logger.LogDebug($"send H264 {videoChannel.RTPLocalEndPoint}->{dstEndPoint} timestamp {videoTrack.Timestamp}, FU-A {h264RtpHdr.HexStr()}, payload length {payloadLength}, seqnum {videoTrack.SeqNum}, marker {markerBit}.");
-
-                    videoTrack.SeqNum = (videoTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(videoTrack.SeqNum + 1);
                 }
             }
 
@@ -1649,9 +1651,7 @@ namespace SIPSorcery.Net
                         byte[] buffer = rtpEvent.GetEventPayload();
 
                         int markerBit = (i == 0) ? 1 : 0;  // Set marker bit for the first packet in the event.
-                        SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, markerBit, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.SeqNum, AudioRtcpSession);
-
-                        audioTrack.SeqNum = (audioTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(audioTrack.SeqNum + 1);
+                        SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, markerBit, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.GetNextSeqNum(), AudioRtcpSession);
                     }
 
                     await Task.Delay(samplePeriod, cancellationToken).ConfigureAwait(false);
@@ -1664,9 +1664,7 @@ namespace SIPSorcery.Net
                             rtpEvent.Duration += rtpTimestampStep;
                             byte[] buffer = rtpEvent.GetEventPayload();
 
-                            SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, 0, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.SeqNum, AudioRtcpSession);
-
-                            audioTrack.SeqNum = (audioTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(audioTrack.SeqNum + 1);
+                            SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, 0, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.GetNextSeqNum(), AudioRtcpSession);
 
                             await Task.Delay(samplePeriod, cancellationToken).ConfigureAwait(false);
                         }
@@ -1678,9 +1676,7 @@ namespace SIPSorcery.Net
                             rtpEvent.Duration = rtpEvent.TotalDuration;
                             byte[] buffer = rtpEvent.GetEventPayload();
 
-                            SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, 0, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.SeqNum, AudioRtcpSession);
-
-                            audioTrack.SeqNum = (audioTrack.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(audioTrack.SeqNum + 1);
+                            SendRtpPacket(GetRtpChannel(SDPMediaTypesEnum.audio), dstEndPoint, buffer, startTimestamp, 0, rtpEvent.PayloadTypeID, audioTrack.Ssrc, audioTrack.GetNextSeqNum(), AudioRtcpSession);
                         }
                     }
                 }
@@ -1726,9 +1722,7 @@ namespace SIPSorcery.Net
 
                 if (dstEndPoint != null)
                 {
-                    SendRtpPacket(rtpChannel, dstEndPoint, payload, timestamp, markerBit, payloadTypeID, track.Ssrc, track.SeqNum, rtcpSession);
-
-                    track.SeqNum = (track.SeqNum == UInt16.MaxValue) ? (ushort)0 : (ushort)(track.SeqNum + 1);
+                    SendRtpPacket(rtpChannel, dstEndPoint, payload, timestamp, markerBit, payloadTypeID, track.Ssrc, track.GetNextSeqNum(), rtcpSession);
                 }
             }
         }
@@ -1812,6 +1806,8 @@ namespace SIPSorcery.Net
                         else
                         {
                             buffer = buffer.Take(outBufLen).ToArray();
+                            //logger.LogTrace("RTCP:");
+                            //logger.LogTrace(buffer.HexStr());
                         }
                     }
 
@@ -1874,10 +1870,15 @@ namespace SIPSorcery.Net
                                 rtcpSession.ReportReceived(remoteEndPoint, rtcpPkt);
                                 OnReceiveReport?.Invoke(remoteEndPoint, rtcpSession.MediaType, rtcpPkt);
                             }
+                            else if(rtcpPkt.ReceiverReport?.SSRC == RTCP_RR_NOSTREAM_SSRC)
+                            {
+                                // Ignore for the time being. Not sure what use an empty RTCP Receiver Report can provide.
+                            }
                             else if (AudioRtcpSession?.PacketsReceivedCount > 0 || VideoRtcpSession?.PacketsReceivedCount > 0)
                             {
                                 // Only give this warning if we've received at least one RTP packet.
                                 logger.LogWarning("Could not match an RTCP packet against any SSRC's in the session.");
+                                logger.LogTrace(rtcpPkt.GetDebugSummary());
                             }
                         }
                     }
@@ -1968,9 +1969,9 @@ namespace SIPSorcery.Net
                                     }
                                 }
 
-                                // Note AC 24 Dec 2020: The probelm with waiting until the remote description is set is that the remote peer often starts sending
+                                // Note AC 24 Dec 2020: The problem with waiting until the remote description is set is that the remote peer often starts sending
                                 // RTP packets at the same time it signals its SDP offer or answer. Generally this is not a problem for audio but for video streams
-                                // the first RTP packet(s) are the key frame and if they are ignored the video stream will take addtional time or manual 
+                                // the first RTP packet(s) are the key frame and if they are ignored the video stream will take additional time or manual 
                                 // intervention to synchronise.
                                 //if (RemoteDescription != null)
                                 //{
